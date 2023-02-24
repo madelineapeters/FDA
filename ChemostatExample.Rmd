@@ -1,0 +1,122 @@
+---
+title: "Chemostat Example"
+author: "Madeline Peters"
+date: "26/01/2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load required packages
+```{r}
+library(tidyverse)
+library(deSolve)
+library(fda)
+```
+
+# Preamble (from Hooker, Ramsay and Xiao 2016)
+"In this [example] we deal with data generated from a laboratory-based ecological experiment. In this system, an algae of genus *Chlorella*, C, is grown in a chemostat, a large glass test- tube to which a nutrient-rich medium is continuously added, and from which the contents are removed (including the algae) at a constant rate. The growth of the algal population is limited by nutrition in the ecology and by predation by rotifers, *Brachionus*, B – a genus of microscopic animals. The rotifers reproduce according to how much algae they consume and die either from natural causes or when they are removed from the tank. Data from a run of this experiment are taken from Becks, Ellner, Jones, and Hairston (2010).
+
+# Set up data
+Read in data:
+```{r}
+data("ChemoRMData")
+```
+
+Store time and data:
+```{r}
+data = log(ChemoRMData)
+head(data)
+time = ChemoRMTime
+```
+
+Specify Rosenzweig-MacArthur model (1969), which describes algae carrying-capacity-limited reproduction and predation, as well as rotifer growth and natural mortality:
+```{r}
+RosMac = function(t, x, p, more) {
+  p = exp(p); x = exp(x)
+  dx = x
+  dx[,"C"] = p["rho"] * (1 - x[, "C"] / p["kappaC"]) - p["gamma"] * x[, "B"] / (p["kappaB"] + x[, "C"])
+  dx[, "B"] <- p["chi"] * p["gamma"] * x[, "C"] /
+    (p["kappaB"] + x[, "C"]) - p["delta"]
+  return(dx)
+}
+```
+
+Define initial parameters:
+```{r}
+varnames = RMvarnames
+varnames
+parnames = RMparnames
+parnames
+```
+
+# Obtain initial coefficient estimates using *fda* package
+
+Set up basis functions:
+```{r}
+rr = range(time)
+breaks = seq(rr[1],rr[2],by=1)
+ChemoRMbasis = create.bspline.basis(rr,norder=4,breaks=breaks)
+```
+
+Obtain initial coefficients by penalizing the second derivative and using a lambda (roughness weight) of 10:
+```{r}
+fd0 = smooth.basis(time, data, fdPar(ChemoRMbasis, int2Lfd(2), 10))
+coef0 = fd0$fd$coef
+colnames(coef0) = varnames
+```
+
+We'll also set initial parameter values. Note that there are estimates for rho and kappaC from empirical work in the absence of predation, so we'll fix those parameters and estimate gamma, kappaB, chi and delta:
+```{r}
+pars = log(ChemoRMPars)
+names(pars) = parnames
+pars
+```
+To fix rho and kappaC, we will define activepars as the indices of the parameters in pars that we wish to estimate. We can call activepars in the active argument in the ParsMatchOpt and outeropt, as well as Profile.LS.
+```{r}
+activepars = 3:6
+```
+
+# Profiling
+Set up profiling objects lik and proc, where lik maps x to y and proc maps x to Dx:
+```{r}
+out = LS.setup(pars = pars, coefs=coef0, basisvals=ChemoRMbasis, fn=RosMac, lambda=c(5e4,5e2), times=time)
+lik = out$lik
+proc = out$proc
+```
+
+Obtain updated parameter estimates. The "active" elements tell ParsMatchOpt which elements of pars to estimate.
+```{r}
+res1 = ParsMatchOpt(pars,coef0,proc,active=activepars)
+```
+
+Run profiling procedure:
+```{r}
+res2 = outeropt(data, time, res1$pars, coef0, lik, proc, active=activepars)
+```
+
+Construct diagnostic plots:
+```{r}
+out2 = CollocInferPlots(res2$coefs, res2$pars, lik, proc, times=time, data=data)
+```
+
+# Use forward prediction error to choose lambda
+```{r}
+whichtimes = cbind(1:102,6:107)
+lambdafac = c(0.1,0.5,1,5,10)
+FPEs = 0*lambdafac
+temp.pars = res2$pars
+temp.coefs = res2$coefs
+
+for (ilam in 1:length(lambdafac)){
+  t.res = Profile.LS(RosMac,data,time,temp.pars,temp.coefs,ChemoRMbasis,lambdafac[ilam]*c(5e4,5e2),active=activepars, out.meth="nlminb")
+  FPEs[ilam] = forward.prediction.error(time,data,t.res$coefs,lik,proc,t.res$pars,whichtimes)
+  temp.pars = t.res$pars
+  temp.coefs = t.res$coefs
+}
+FPEs
+```
+
+

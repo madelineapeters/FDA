@@ -1,0 +1,180 @@
+---
+title: "SIR Example"
+author: "Madeline Peters"
+date: "26/01/2023"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We'll use a basic SIR model:
+
+$\frac{dS}{dt}=\alpha R-\beta S I \\ \frac{dI}{dt}=\beta SI - \kappa I \\ \frac{dR}{dt}=\kappa I - \alpha R$ 
+
+where $\alpha$ is the rate of immunity loss, $\beta$ is the transmission coefficient and $\kappa$ is the recovery rate.
+
+## Load required packages
+```{r}
+library(tidyverse)
+library(deSolve)
+library(fda)
+library(CollocInfer)
+```
+
+## Set seed
+```{r}
+set.seed(1234)
+```
+
+# Generate main data
+Define vectors of names for the indices of arrays containing parameters and values of the trajectories:
+```{r}
+SIRvarnames = c("S","I","R")
+SIRparnames = c("alpha","beta","kappa")
+```
+
+To use the function `lsoda`, we need to specify initial conditions, respectively:
+```{r}
+x0 = c(10000,1,0)
+names(x0) = SIRvarnames
+```
+
+Specify the initial values for the parameter vector $\theta$ = c($\alpha$,$\beta$,$\kappa$):
+```{r}
+SIRpars = c(0.4,0.001,0.5)
+names(SIRpars) = SIRparnames
+```
+
+We need a function to evalute the SIR equations. The function should return a names list, with a member names fn and containing the function evaluation
+```{r}
+sir.ode = function(times,x,p){
+  dx = x
+  dimnames(dx) = dimnames(x)
+  dx["S"] = p["alpha"] * x["R"] - p["beta"] * x["S"] * x["I"]
+  dx["I"] = p["beta"] * x["S"] * x["I"] - p["kappa"] * x["I"]
+  dx["R"] = p["kappa"] * x["I"] - p["alpha"] * x["R"]
+  return(list(dx))
+}
+```
+
+Now define a time vector from 0 to 20:
+```{r}
+sirplottimes = seq(0,10,0.25)
+```
+
+Call function `lsoda` to compute the approximate solution at the time values specified above. The output should be an $n \times 4$ matrix where the first column is the evaluation times.
+```{r}
+out = lsoda(x0,times=sirplottimes,sir.ode,SIRpars)
+```
+
+Plotting out should show SIR dynamics:
+```{r}
+matplot(out[,1],out[,2:4], type="l")
+legend("topright",c("S","I","R"))
+```
+
+Now we will generate some data with noise drawn from a normal distribution with mean zero and standard deviation 200. We will also replace all negative values with zero and round so the data are counts.
+```{r}
+SIRtimes = seq(0,10,0.25)
+SIRn = length(SIRtimes)
+out = lsoda(x0,time=SIRtimes,sir.ode,SIRpars)
+SIRdata = out[,2:4] + 200*matrix(rnorm(3*SIRn), SIRn, 3)
+SIRdata[SIRdata < 0] = 0
+SIRdata = round(SIRdata)
+matplot(SIRdata[,1:3], type="l",xlab="Time",ylab="S,I,R")
+```
+
+# Obtain initial coefficient estimates using *fda* package
+
+Set up basis functions:
+```{r}
+SIRrange = c(0,10)
+breaks = seq(0,10,0.25)
+SIRbasis = create.bspline.basis(SIRrange,norder=4,breaks=breaks)
+```
+
+Obtain initial coefficients by penalizing the second derivative and using a lambda (roughness weight) of 10:
+```{r}
+fd0 = smooth.basis(SIRtimes, SIRdata, fdPar(SIRbasis, int2Lfd(2), 10))
+coef0 = fd0$fd$coef
+colnames(coef0) = SIRvarnames
+```
+
+We'll also set initial parameter values. We'll pretend that we know $\beta$, so we'll set up active parameters for fitting below and for now give an initial guess of 1 for both $\alpha$ and $\kappa$.
+```{r}
+pars = SIRpars
+pars[c(1,3)] = c(1,1)
+names(pars) = SIRparnames
+pars
+```
+To fix $\beta$, we will define activepars as the indices of the parameters in pars that we wish to estimate. We can call activepars in the active argument in the ParsMatchOpt and outeropt, as well as Profile.LS.
+```{r}
+activepars = c(1,3)
+```
+
+# Profiling
+For the SIR equations, write function for use with *CollocInfer*:
+```{r}
+sir.fun = function(times,x,p,more){
+  dx = x
+  dx[,"S"] = p["alpha"] * x[,"R"] - p["beta"] * x[,"S"] * x[,"I"]
+  dx[,"I"] = p["beta"] * x[,"S"] * x[,"I"] - p["kappa"] * x[,"I"]
+  dx[,"R"] = p["kappa"] * x[,"I"] - p["alpha"] * x[,"R"]
+  return(dx)
+}
+```
+
+Set up profiling objects `lik` and `proc`, where `lik` maps $x$ to $y$ and proc maps $x$ to $Dx$:
+```{r}
+out = LS.setup(pars = pars, coefs=coef0, basisvals=SIRbasis, fn=sir.fun, lambda=100, times=SIRtimes)
+lik = out$lik
+proc = out$proc
+```
+
+Obtain updated parameter estimates. The "active" elements tell ParsMatchOpt which elements of pars to estimate.
+```{r}
+res1 = ParsMatchOpt(pars,coef0,proc,active=activepars)
+```
+Run profiling procedure:
+```{r}
+res2 = outeropt(SIRdata, SIRtimes, res1$pars, coef0, lik, proc, active=activepars)
+```
+View parameter estimates:
+```{r}
+res2$pars
+```
+
+Obtain confidence intervals for parameter estimates:
+```{r}
+covar = Profile.covariance(res2$pars, times = SIRtimes, data = SIRdata, coefs = res2$coefs, lik = lik, proc = proc, active = activepars)
+CIs = cbind(res2$pars[activepars] - 2 * sqrt(diag(covar)),res2$pars[activepars] + 2 * sqrt(diag(covar)))
+rownames(CIs) = SIRparnames[activepars]
+CIs
+```
+
+Plot data and fit:
+```{r}
+matplot(SIRtimes,SIRdata,pch=SIRvarnames,xlab="Time",ylab="")
+SIR.fd = fd(res2$coefs,SIRbasis)
+lines(SIR.fd,lwd=2,col="red",lty=1)
+```
+Use forward prediction error to confirm $\lambda$:
+```{r eval=FALSE, include=FALSE}
+whichtimes = cbind(1:10,11:20)
+lambdafac = 10^c(-2:4)
+FPEs = 0*lambdafac
+temp.pars = res2$pars
+temp.coefs = res2$coefs
+
+for (ilam in 1:length(lambdafac)){
+  t.res = Profile.LS(sir.fun,SIRdata,SIRtimes,temp.pars,temp.coefs,SIRbasis,lambdafac[ilam],active=activepars)
+  FPEs[ilam] = forward.prediction.error(SIRtimes,SIRdata,t.res$coefs,lik,proc,t.res$pars,whichtimes)
+  temp.pars = t.res$pars
+  temp.coefs = t.res$coefs
+}
+FPEs
+```

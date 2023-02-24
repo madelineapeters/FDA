@@ -1,0 +1,180 @@
+---
+title: "dRdt Example"
+author: "Madeline Peters"
+date: "23/01/2023"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+This is Madeline's first (recent) attempt at an R Markdown document. This document should contain steps for data generation, creating a functional data object from said data and applying linear operators on said functional data object. 
+
+The model in question used to generate the data is
+$$
+\frac{dR}{dt}=B(t)-\mu R(t)
+$$
+where B is a parameter that is a function of time. Here we consider B(t) that is constant, step-wise and parabolic.
+
+## Load required packages
+```{r}
+library(tidyverse)
+library(deSolve)
+library(fda)
+```
+
+## Simulate data for constant B
+We first consider a constant value for B across time, i.e., $B(t)=3*10^5$ for all values of $t$. We initialize the model with $R_0=5*10^6$ and set $\mu=0.025$. We solve the model from time $t=0$ to $t=10$. In this first example, we do not considered any measurement error, and so $R_{meas}(t_i)=R(t_i)$.
+```{r}
+#Define function that descibes ODE of changes in R as a function of time
+dRdt = function(t, x, parms) {
+  with(as.list(c(parms, x)), {
+    dR = B - R*mu
+    res = c(dR)
+    list(res,B)
+  })
+}
+# Specify initial conditions and parameter values
+y0 = c(R = 5000000)
+pars = c(mu=0.025,B=300000)
+#Specify timescale of interest
+tout=seq(from=0,to=10,by=0.5)
+#ODE integration and view head of data
+out=ode(y=y0, times=tout, func=dRdt, parms=pars)
+#Convert output to a dataframe
+out = as.data.frame(out)
+#No error being considered, so Rmeas = R. Comment out the line immediately below and uncomment the line below that to specify measurement error normally distributed around the true value with some standard deviation.
+out$Rmeas = out$R
+#out$Rmeas = sapply(out$R,FUN=function(x){rnorm(1,x,200000)})
+```
+The true data (circles) and measured data (line) can be plotted.
+```{r pressure, echo=FALSE, fig.align = 'left'}
+plot(out$time,out$Rmeas,xlab="Time",ylab="R (true and measured)")
+lines(out$time,out$R)
+```
+
+## Create FDA object for constant B
+Set-up data in long form and create vector of times we are interested in:
+```{r}
+Routput = as.matrix(out)
+rMeasData = as.matrix(out[,4])  #transpose here if necessary (should be long)
+
+#create vector of times (with one for each day)
+daytime  = seq(from=0,to=10,by=0.5)
+```
+Create a B-spline basis, where the time interval is 1 to 10, there are 10 basis functions and the order is 4 (implicit in the function):
+```{r}
+rMeasbasis    = create.bspline.basis(c(0,10),10)
+```
+Evaluate the basis at the times specified above:
+```{r}
+rMeasbasismat = eval.basis(rMeasbasis, daytime)
+```
+Compute coefficients for the functional data object by the usual equations for regression coefficients, $c=(X'X)^{-1}X'y$.
+```{r}
+rMeascoef = solve(crossprod(rMeasbasismat),
+                  crossprod(rMeasbasismat,rMeasData))
+```
+These same coefficients can also be computed by:
+```{r}
+rMeascoef = lsfit(rMeasbasismat, rMeasData, intercept=FALSE)$coef
+```
+Create a functional data object using the coefficients, the basis and a list of names (for plotting):
+```{r}
+rMeasfd   = fd(rMeascoef, rMeasbasis,
+               list("Time", "Individual", "R measured"))
+```
+Plot the fit of the FD object to the actual data
+```{r}
+plotfit.fd(rMeasData, daytime, rMeasfd,
+           lty=1, lwd=2, main='')
+```
+
+## Apply linear operator for constant B
+Because $\frac{dR}{dt}=B(t)-\mu R(t)$, we can solve for $B(t)=\frac{dR}{dt}+\mu R(t)$. To solve this, we first create a new functional data object that is the first derivative of $R$, $\frac{dR}{dt}$:
+```{r}
+rMeasfd.D1 = deriv.fd(rMeasfd, 1)
+```
+Create an FD object multiplied by constant $\mu$:
+```{r}
+mufd = 0.025*rMeasfd
+```
+Plot what should be $B(t)$, i.e., $\frac{dR}{dt} + \mu R(t)$; lay over constant, true function for B in red:
+```{r}
+plot(mufd+rMeasfd.D1,ylab="Estimated B",xlab="Day",ylim=c(200000,400000))
+abline(a=300000,b=0,col="red")
+```
+
+## Create FDA object for constant B using smoothing
+The function smooth.basis is provided to produce the same results as the fd function above without the need to explicitly evaluate the basis functions beforehand. We need to provide the vector of times, the data and the basis.
+```{r}
+rMeasfd.smooth = smooth.basis(daytime,rMeasData,rMeasbasis)
+plotfit.fd(rMeasData, daytime, rMeasfd.smooth$fd,
+           lty=1, lwd=2, main='',ylab="R measured",xlab="Time")
+```
+To obtain the degrees of freedom used to obtain the fitted curve:
+```{r}
+rMeasfd.smooth$df
+```
+
+To obtain the the value of the generalized cross-validation criterion: a measure of lack of fit discounted for degrees of freedom. If there are multiple curves, a vector is returned containing gcv values for each curve.
+```{r}
+rMeasfd.smooth$gcv
+```
+We can also compute the penalty matrix (where the second input value is the linear differential operator):
+```{r}
+rMeasRmat = eval.penalty(rMeasbasis, 0)
+```
+
+Now we're going to select a lambda (weight of the roughness penalty) by looping through values and minimising the GCV score. We're going to explicitly penalise the roughness of acceleration by using the second derivative.
+```{r}
+#Log lambda values
+loglam         = seq(-10, 0, 0.25)
+#Vector to output GCV to
+Gcvsave        = rep(NA, length(loglam))
+names(Gcvsave) = loglam
+Dfsave         = Gcvsave
+for(i in 1:length(loglam)){
+  rMeasfdPari  = fdPar(rMeasbasis, Lfdobj=2, 10^loglam[i])
+  rMeasSm.i    = smooth.basis(daytime, rMeasData, rMeasfdPari)
+  Gcvsave[i] = sum(rMeasSm.i$gcv)
+  Dfsave[i]  = rMeasSm.i$df
+}
+plot(seq(-10,0,0.25),Gcvsave,xlab="Log lambda",ylab="GCV")
+which(Gcvsave==min(Gcvsave))
+```
+
+Define a functional parameter object. A functional parameter object is a functional data object with additional slots specifying a roughness penalty, a smoothing parameter and whether or not the functional parameter is to be estimated or held fixed.
+```{r}
+lambda.choice = seq(-10,0,0.25)[which(Gcvsave==min(Gcvsave))]
+rMeasfdPar = fdPar(rMeasbasis, 2, 10^(lambda.choice))
+```
+
+Define new functional data object that incorporates the roughness penalty:
+```{r}
+rMeasfd.smoothPar = smooth.basis(daytime,rMeasData,rMeasfdPar)
+```
+
+Plot the resulting FD object and the original data:
+```{r}
+plot(rMeasfd.smoothPar,xlab="Time",ylab="R measured")
+points(daytime,rMeasData)
+```
+## Apply linear operator for constant B with smoothing
+Create a new functional data object that is the first derivative of $R$, $\frac{dR}{dt}$:
+```{r}
+rMeasfd.smoothParD1 = deriv.fd(rMeasfd.smoothPar$fd, 1)
+```
+Create an FD object multiplied by constant $\mu$:
+```{r}
+mufd.smoothPar = 0.025*rMeasfd.smoothPar$fd
+```
+Plot what should be $B(t)$, i.e., $\frac{dR}{dt} + \mu R(t)$; lay over constant, true function for B in red:
+```{r}
+plot(mufd.smoothPar+rMeasfd.smoothParD1,ylab="Estimated B (with smoothing)",xlab="Day",ylim=c(200000,400000))
+abline(a=300000,b=0,col="red")
+```

@@ -1,0 +1,148 @@
+---
+title: "SIR Indirect Measurement Example"
+author: "Madeline Peters"
+date: "30/01/2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We'll use a basic SIR model:
+
+$\frac{dS}{dt}=\alpha R-\beta S I \\ \frac{dI}{dt}=\beta SI - \kappa I \\ \frac{dR}{dt}=\kappa I - \alpha R$ 
+
+where $\alpha$ is the rate of immunity loss, $\beta$ is the transmission coefficient and $\kappa$ is the recovery rate.
+
+However, we will assume that we can't tell the difference between recovered and susceptibles, i.e., we can only observe their sum, $S+R$.
+
+## Load required packages
+```{r}
+library(tidyverse)
+library(deSolve)
+library(fda)
+library(CollocInfer)
+```
+
+## Set seed
+```{r}
+set.seed(1234)
+```
+
+# Generate data
+Define vectors of names for the indices of arrays containing parameters and values of the trajectories:
+```{r}
+SIRvarnames = c("S","I","R")
+SIRparnames = c("alpha","beta","kappa")
+```
+
+To use the function `lsoda`, we need to specify initial conditions, respectively:
+```{r}
+x0 = c(10000,1,0)
+names(x0) = SIRvarnames
+```
+
+Specify the initial values for the parameter vector $\theta$ = c($\alpha$,$\beta$,$\kappa$):
+```{r}
+SIRpars = c(0.4,0.001,0.5)
+names(SIRpars) = SIRparnames
+```
+
+We need a function to evalute the SIR equations. The function should return a names list, with a member names fn and containing the function evaluation.
+```{r}
+sir.ode = function(times,x,p){
+  dx = x
+  dimnames(dx) = dimnames(x)
+  dx["S"] = p["alpha"] * x["R"] - p["beta"] * x["S"] * x["I"]
+  dx["I"] = p["beta"] * x["S"] * x["I"] - p["kappa"] * x["I"]
+  dx["R"] = p["kappa"] * x["I"] - p["alpha"] * x["R"]
+  return(list(dx))
+}
+```
+
+Now define a time vector from 0 to 20:
+```{r}
+sirplottimes = seq(0,10,0.25)
+```
+
+Call function `lsoda` to compute the approximate solution at the time values specified above. The output should be an $n \times 4$ matrix where the first column is the evaluation times.
+```{r}
+out = lsoda(x0,times=sirplottimes,sir.ode,SIRpars)
+```
+
+Plotting out should show SIR dynamics:
+```{r}
+matplot(out[,1],out[,2:4], type="l")
+legend("topright",c("S","I","R"))
+```
+
+Now we will generate some data with noise drawn from a normal distribution with mean zero and standard deviation 200. We replace any negative values with 0 and round values to represent counts:
+```{r}
+SIRtimes = seq(0,10,0.25)
+SIRn = length(SIRtimes)
+out = lsoda(x0,time=SIRtimes,sir.ode,SIRpars)
+SIRdata = out[,2:4] + 200*matrix(rnorm(3*SIRn), SIRn, 3)
+SIRdata[SIRdata < 0] = 0
+SIRdata = round(SIRdata)
+matplot(SIRdata[,1:3], type="l",xlab="Time",ylab="S,I,R")
+```
+
+Finally we will make our "observed" data, which contains only the sum of $S$ and $R$, as well as $I$:
+```{r}
+SIRdata2 = cbind(SIRdata[,1]+SIRdata[,2],SIRdata[,2])
+matplot(SIRdata[,1:2], type="l",xlab="Time",ylab="S+R,I")
+```
+
+# Set up equations for use with *CollocInfer*
+
+For the SIR equations, we now write a function for use with *CollocInfer*:
+```{r}
+sir.fun = function(times,x,p,more){
+  dx = x
+  dx[,"S"] = p["alpha"] * x[,"R"] - p["beta"] * x[,"S"] * x[,"I"]
+  dx[,"I"] = p["beta"] * x[,"S"] * x[,"I"] - p["kappa"] * x[,"I"]
+  dx[,"R"] = p["kappa"] * x[,"I"] - p["alpha"] * x[,"R"]
+  return(dx)
+}
+```
+
+We next write a function to go from states to observations exactly by repeating the summation process above. The structure of this function looks exactly like the functions we employ for the right hand side of an ODE. This function is added as the `likfn` argument to `LS.setup`, `smooth.LS` or `profile.LS`.
+```{r}
+sirobs.fun = function(times,x,p,more){
+  y = cbind(x[,"S"]+x[,"R"], x[,"I"])
+  return(y)
+}
+```
+
+# Obtain initial coefficient estimates using *fda* package
+
+Set up basis functions:
+```{r}
+SIRrange = c(0,10)
+breaks = seq(0,10,0.25)
+SIRbasis = create.bspline.basis(SIRrange,norder=4,breaks=breaks)
+```
+
+Obtain initial coefficients for $I$ only by penalizing the second derivative and using a lambda (roughness weight) of 10. Set coefficients for the unobserved state variables to zero.
+```{r}
+fd0 = smooth.basis(SIRtimes, SIRdata[,2], fdPar(SIRbasis, int2Lfd(2), 10))
+coef0 = fd0$fd$coef
+coefs02 = matrix(0,nrow=nrow(coef0),ncol=3)
+rownames(coefs02) = rownames(coef0)
+coefs02[,2] = coef0[,1]
+colnames(coefs02) = c("S","I","R")
+```
+
+# Make `lik` and `proc` objects
+```{r}
+par.guess = c(0.5,0.005,0.4)
+out = LS.setup(pars=par.guess,coefs=coefs02,basisvals=SIRbasis,fn=sir.fun,lambda=100,times=SIRtimes,likfn=sirobs.fun)
+lik = out$lik
+proc = out$proc
+```
+
+Obtain updated coefficients by using `FitMatchOpt`:
+```{r}
+Fres3 = FitMatchOpt(coefs02,c(1,3),par.guess,proc,meth="maxNR")
+```

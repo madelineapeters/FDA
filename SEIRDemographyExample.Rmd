@@ -1,0 +1,206 @@
+---
+title: "SEIR with Demography Example"
+author: "Madeline Peters"
+date: "30/01/2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We'll use a basic SEIR model with demography:
+
+$\frac{dS}{dt}=\mu*(S+I+E+R) + \alpha R-\beta S I - \delta S\\ \frac{dE}{dt}=\beta S I - \gamma E - \delta E \\ \frac{dI}{dt}=\gamma E - \kappa I -\delta I\\ \frac{dR}{dt}=\kappa I - \alpha R - \delta R$ 
+
+where $\alpha$ is the rate of immunity loss, $\beta$ is the transmission coefficient, $\kappa$ is the recovery rate, $\mu$ is the birth rate and $\delta$ is the natural mortality rate.
+
+## Load required packages
+```{r}
+library(tidyverse)
+library(deSolve)
+library(fda)
+library(CollocInfer)
+```
+
+## Set seed
+```{r}
+set.seed(1234)
+```
+
+# Generate main data
+Define vectors of names for the indices of arrays containing parameters and values of the trajectories:
+```{r}
+SEIRvarnames = c("S","E","I","R")
+SEIRparnames = c("alpha","beta","kappa","mu","gamma","delta")
+```
+
+To use the function "lsoda", we need to specify initial conditions, respectively:
+```{r}
+x0 = c(10000,0,1,0)
+names(x0) = SEIRvarnames
+```
+
+Specify the initial values for the parameter vector $\theta$ = c($\alpha$,$\beta$,$\kappa$,$\mu$,$\gamma$,$\delta$):
+```{r}
+SEIRpars = c(0.4,0.001,0.5,0.01,0.1,0.025)
+names(SEIRpars) = SEIRparnames
+```
+
+We need a function to evaluate the SEIR equations. The function should return a names list, with a member names fn and containing the function evaluation
+```{r}
+seir.ode = function(times,x,p){
+  dx = x
+  dimnames(dx) = dimnames(x)
+  dx["S"] = p["mu"] * (x["S"] + x["E"] + x["I"] + x["R"]) + p["alpha"] * x["R"] - p["beta"] * x["S"] * x["I"] - p["delta"] * x["S"]
+  dx["E"] = p["beta"] * x["S"] * x["I"] - p["gamma"] * x["E"] - p["delta"] * x["E"]
+  dx["I"] = p["gamma"] * x["E"] - p["kappa"] * x["I"] - p["delta"] * x["I"]
+  dx["R"] = p["kappa"] * x["I"] - p["alpha"] * x["R"] - p["delta"] * x["R"]
+  return(list(dx))
+}
+```
+
+Now define a time vector from 0 to 20:
+```{r}
+seirplottimes = seq(0,20,0.25)
+```
+
+Call function `lsoda` to compute the approximate solution at the time values specified above. The output should be an $n \times 5$ matrix where the first column is the evaluation times.
+```{r}
+out = lsoda(x0,times=seirplottimes,seir.ode,SEIRpars)
+```
+
+Plotting out should show SEIR dynamics:
+```{r}
+out.dat = as.data.frame(out) %>% gather(.,"Type","Count",2:5)
+ggplot()+geom_line(data=out.dat,aes(x=time,y=Count,col=Type))+xlab("Time")+ylab("Count")+theme_classic()
+```
+Now we will generate some data with noise drawn from a normal distribution with mean zero and standard deviation 200. We will ensure all values are positive and turned into counts:
+```{r}
+SEIRtimes = seq(0,20,0.25)
+SEIRn = length(SEIRtimes)
+out = lsoda(x0,time=SEIRtimes,seir.ode,SEIRpars)
+SEIRdata = out[,2:5] + 200*matrix(rnorm(4*SEIRn), SEIRn, 4)
+SEIRdata[SEIRdata < 0] = 0
+SEIRdata = round(SEIRdata)
+out.dat2 = as.data.frame(SEIRdata) %>% gather(.,"Type","Count",1:4)
+out.dat2$Time = SEIRtimes
+ggplot()+geom_line(data=out.dat2,aes(x=Time,y=Count,col=Type))+xlab("Time")+ylab("Count")+theme_classic()
+```
+
+# Assuming recovered $R$ individuals cannot be measured
+
+We're going to pretend we don't have a count of recovered individuals, so that we just have $SE$, $E$ and $I$ measurements:
+```{r}
+SEIRdata2 = SEIRdata
+SEIRdata2[,4] = NA
+```
+
+## Set up equations for use with *CollocInfer*
+
+For the SIR equations, we now write a function for use with *CollocInfer*:
+```{r}
+seir.fun = function(times,x,p,more){
+  dx = x
+  dx[,"S"] = p["mu"] * (x[,"S"] + x[,"E"] + x[,"I"] + x[,"R"]) + p["alpha"] * x[,"R"] - p["beta"] * x[,"S"] * x[,"I"] - p["delta"] * x[,"S"]
+  dx[,"E"] = p["beta"] * x[,"S"] * x[,"I"] - p["gamma"] * x[,"E"] - p["delta"] * x[,"E"]
+  dx[,"I"] = p["gamma"] * x[,"E"] - p["kappa"] * x[,"I"] - p["delta"] * x[,"I"]
+  dx[,"R"] = p["kappa"] * x[,"I"] - p["alpha"] * x[,"R"] - p["delta"] * x[,"R"]
+  return(dx)
+}
+```
+
+## Obtain initial coefficient estimates using *fda* package
+
+Set up basis functions:
+```{r}
+SEIRrange = c(0,20)
+breaks = seq(0,20,0.25)
+SEIRbasis = create.bspline.basis(SEIRrange,norder=4,breaks=breaks)
+```
+
+Obtain initial coefficients for $S$, $E$ and $I$ only by penalizing the second derivative and using a lambda (roughness weight) of 10. Set coefficients for the unobserved state variables to zero.
+```{r}
+fd0 = smooth.basis(SEIRtimes, SEIRdata2[,1:3], fdPar(SEIRbasis, int2Lfd(2), 10))
+coef0 = fd0$fd$coef
+coefs02 = matrix(0,nrow=nrow(coef0),ncol=4)
+rownames(coefs02) = rownames(coef0)
+coefs02[,1:3] = coef0[,1:3]
+colnames(coefs02) = c("S","E","I","R")
+```
+
+## Make `lik` and `proc` objects
+```{r}
+par.guess = c(0.5,0.005,0.3,0.02,0.1,0.01)
+out = LS.setup(pars=par.guess,coefs=coefs02,basisvals=SEIRbasis,fn=seir.fun,lambda=100,times=SEIRtimes)
+lik = out$lik
+proc = out$proc
+```
+
+Obtain updated coefficients by using `FitMatchOpt`:
+```{r eval=FALSE, include=FALSE}
+Fres3 = FitMatchOpt(coefs02,c(4),par.guess,proc,meth="m")
+```
+
+# Assuming susceptibles $S$ and exposed $E$ are indistinguishable
+
+We're going to pretend we don't know who is exposed, so that we just have $S+E$, $I$ and $R$ measurements:
+```{r}
+SEIRdata3 = cbind(SEIRdata[,1]+SEIRdata[,2],SEIRdata[,3],SEIRdata[,4])
+head(SEIRdata3)
+colnames(SEIRdata3) = c("Sprime","I","R")
+```
+
+## Set up equations for use with *CollocInfer*
+
+For the SIR equations, we now write a function for use with *CollocInfer*:
+```{r}
+seir.fun = function(times,x,p,more){
+  dx = x
+  dx[,"S"] = p["mu"] * (x[,"S"] + x[,"E"] + x[,"I"] + x[,"R"]) + p["alpha"] * x[,"R"] - p["beta"] * x[,"S"] * x[,"I"] - p["delta"] * x[,"S"]
+  dx[,"E"] = p["beta"] * x[,"S"] * x[,"I"] - p["gamma"] * x[,"E"] - p["delta"] * x[,"E"]
+  dx[,"I"] = p["gamma"] * x[,"E"] - p["kappa"] * x[,"I"] - p["delta"] * x[,"I"]
+  dx[,"R"] = p["kappa"] * x[,"I"] - p["alpha"] * x[,"R"] - p["delta"] * x[,"R"]
+  return(dx)
+}
+```
+
+We next write a function to go from states to observations exactly by repeating the summation process above. The structure of this function looks exactly like the functions we employ for the right hand side of an ODE. This function is added as the `likfn` argument to `LS.setup`, `smooth.LS` or `profile.LS`.
+```{r}
+seirobs.fun = function(times,x,p,more){
+  y = cbind(x[,"S"] + x[,"E"], x[,"I"], x[,"R"])
+  return(y)
+}
+```
+
+## Obtain initial coefficient estimates using *fda* package
+
+Set up basis functions:
+```{r}
+SEIRrange = c(0,20)
+breaks = seq(0,20,0.25)
+SEIRbasis = create.bspline.basis(SEIRrange,norder=4,breaks=breaks)
+```
+
+Obtain initial coefficients for $I$ and $R$ only by penalizing the second derivative and using a lambda (roughness weight) of 10. Set coefficients for the unobserved state variables to zero.
+```{r}
+fd0 = smooth.basis(SEIRtimes, SEIRdata3[,2:3], fdPar(SEIRbasis, int2Lfd(2), 10))
+coef0 = fd0$fd$coef
+coefs02 = matrix(0,nrow=nrow(coef0),ncol=4)
+rownames(coefs02) = rownames(coef0)
+coefs02[,3:4] = coef0[,1:2]
+colnames(coefs02) = c("S","E","I","R")
+```
+
+## Make `lik` and `proc` objects
+```{r}
+par.guess = c(0.5,0.005,0.3,0.02,0.1,0.01)
+out = LS.setup(pars=par.guess,coefs=coefs02,basisvals=SEIRbasis,fn=seir.fun,lambda=100,times=SEIRtimes,likfn=seirobs.fun)
+lik = out$lik
+proc = out$proc
+```
+
+Obtain updated coefficients by using `FitMatchOpt`:
+```{r eval=FALSE, include=FALSE}
+Fres3 = FitMatchOpt(coefs02,c(1,2),par.guess,proc,meth="nlminb")
+```

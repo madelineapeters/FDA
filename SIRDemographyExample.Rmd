@@ -1,0 +1,156 @@
+---
+title: "SIR Demography Example"
+author: "Madeline Peters"
+date: "31/01/2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We'll use a basic SIR model with demography:
+
+$\frac{dS}{dt}=\mu*(S+I+R) + \alpha R-\beta S I - \delta S\\ \\ \frac{dI}{dt}=\beta S I - \kappa I -\delta I\\ \frac{dR}{dt}=\kappa I - \alpha R - \delta R$ 
+
+where $\alpha$ is the rate of immunity loss, $\beta$ is the transmission coefficient, $\kappa$ is the recovery rate, $\mu$ is the birth rate and $\delta$ is the natural mortality rate.
+
+## Load required packages
+```{r}
+library(tidyverse)
+library(deSolve)
+library(fda)
+library(CollocInfer)
+```
+
+## Set seed
+```{r}
+set.seed(1234)
+```
+
+# Generate main data
+Define vectors of names for the indices of arrays containing parameters and values of the trajectories:
+```{r}
+SIRvarnames = c("S","I","R")
+SIRparnames = c("alpha","beta","kappa","mu","delta")
+```
+
+To use the function "lsoda", we need to specify initial conditions, respectively:
+```{r}
+x0 = c(10000,1,0)
+names(x0) = SIRvarnames
+```
+
+Specify the initial values for the parameter vector $\theta$ = c($\alpha$,$\beta$,$\kappa$,$\mu$,$\delta$):
+```{r}
+SIRpars = c(0.4,0.001,0.5,0.01,0.025)
+names(SIRpars) = SIRparnames
+```
+
+We need a function to evaluate the SIR equations. The function should return a names list, with a member names fn and containing the function evaluation
+```{r}
+SIR.ode = function(times,x,p){
+  dx = x
+  dimnames(dx) = dimnames(x)
+  dx["S"] = p["mu"] * (x["S"] + x["I"] + x["R"]) + p["alpha"] * x["R"] - p["beta"] * x["S"] * x["I"] - p["delta"] * x["S"]
+  dx["I"] = p["beta"] * x["S"] * x["I"] - p["kappa"] * x["I"] - p["delta"] * x["I"]
+  dx["R"] = p["kappa"] * x["I"] - p["alpha"] * x["R"] - p["delta"] * x["R"]
+  return(list(dx))
+}
+```
+
+Now define a time vector from 0 to 20:
+```{r}
+SIRplottimes = seq(0,20,0.25)
+```
+
+Call function `lsoda` to compute the approximate solution at the time values specified above. The output should be an $n \times 5$ matrix where the first column is the evaluation times.
+```{r}
+out = lsoda(x0,times=SIRplottimes,SIR.ode,SIRpars)
+```
+
+Plotting out should show SIR dynamics:
+```{r}
+out.dat = as.data.frame(out) %>% gather(.,"Type","Count",2:4)
+ggplot()+geom_line(data=out.dat,aes(x=time,y=Count,col=Type))+xlab("Time")+ylab("Count")+theme_classic()
+```
+Now we will generate some data with noise drawn from a normal distribution with mean zero and standard deviation 200. We will ensure all values are positive and turned into counts:
+```{r}
+SIRtimes = seq(0,20,0.25)
+SIRn = length(SIRtimes)
+out = lsoda(x0,time=SIRtimes,SIR.ode,SIRpars)
+SIRdata = out[,2:4] + 200*matrix(rnorm(3*SIRn), SIRn, 3)
+SIRdata[SIRdata < 0] = 0
+SIRdata = round(SIRdata)
+out.dat2 = as.data.frame(SIRdata) %>% gather(.,"Type","Count",1:3)
+out.dat2$Time = SIRtimes
+ggplot()+geom_line(data=out.dat2,aes(x=Time,y=Count,col=Type))+xlab("Time")+ylab("Count")+theme_classic()
+```
+# Assuming recovered $R$ individuals cannot be measured
+
+We're going to pretend we don't have a count of recovered individuals, so that we just have $SE$ and $I$ measurements:
+```{r}
+SIRdata2 = SIRdata
+SIRdata2[,3] = NA
+```
+
+## Set up equations for use with *CollocInfer*
+
+For the SIR equations, we now write a function for use with *CollocInfer*:
+```{r}
+SIR.fun = function(times,x,p,more){
+  dx = x
+  dx[,"S"] = p["mu"] * (x[,"S"] + x[,"I"] + x[,"R"]) + p["alpha"] * x[,"R"] - p["beta"] * x[,"S"] * x[,"I"] - p["delta"] * x[,"S"]
+  dx[,"I"] = p["beta"] * x[,"S"] * x[,"I"] - p["kappa"] * x[,"I"] - p["delta"] * x[,"I"]
+  dx[,"R"] = p["kappa"] * x[,"I"] - p["alpha"] * x[,"R"] - p["delta"] * x[,"R"]
+  return(dx)
+}
+```
+
+## Obtain initial coefficient estimates using *fda* package
+
+Set up basis functions:
+```{r}
+SIRrange = c(0,20)
+breaks = seq(0,20,0.25)
+SIRbasis = create.bspline.basis(SIRrange,norder=4,breaks=breaks)
+```
+
+Obtain initial coefficients for $S$ and $I$ only by penalizing the second derivative and using a lambda (roughness weight) of 10. Set coefficients for the unobserved state variables to zero.
+```{r}
+fd0 = smooth.basis(SIRtimes, SIRdata2[,1:2], fdPar(SIRbasis, int2Lfd(2), 10))
+coef0 = fd0$fd$coef
+coefs02 = matrix(0,nrow=nrow(coef0),ncol=3)
+rownames(coefs02) = rownames(coef0)
+coefs02[,1:2] = coef0[,1:2]
+colnames(coefs02) = c("S","I","R")
+```
+
+## Make `lik` and `proc` objects
+```{r}
+par.guess = SIRpars
+out = LS.setup(pars=par.guess,coefs=coefs02,basisvals=SIRbasis,fn=SIR.fun,lambda=100,times=SIRtimes)
+lik = out$lik
+proc = out$proc
+```
+
+Obtain updated coefficients by using `FitMatchOpt`:
+```{r eval=FALSE, include=FALSE}
+Fres3 = FitMatchOpt(coefs02,c(3),par.guess,proc,meth="maxNR")
+```
+
+## Proceed with profiling
+```{r}
+Ores4 = outeropt(SIRdata,SIRtimes,par.guess,Fres3$coefs,lik,proc,out.meth="optim",in.meth="optim")
+Ores4$pars #false convergence
+```
+Obtain confidence intervals on parameter estimtes:
+```{r}
+covar = Profile.covariance(Ores4$pars, times = SIRtimes, data = SIRdata, coefs = Ores4$coefs, lik = lik, proc = proc)
+covar
+CIs = cbind(Ores4$pars - 2 * sqrt(diag(covar)),Ores4$pars + 2 * sqrt(diag(covar)) )
+rownames(CIs) = SIRparnames
+CIs
+```
+
+

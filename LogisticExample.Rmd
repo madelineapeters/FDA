@@ -1,0 +1,208 @@
+---
+title: "Logistic Example"
+author: "Madeline Peters"
+date: "25/01/2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load required packages
+
+```{r}
+library(deSolve)
+library(CollocInfer)
+library(fda)
+```
+
+## Set seed
+
+```{r}
+set.seed(1234)
+```
+
+# Generate data with noise
+
+Define vectors of names for the state variable and for the parameters:
+```{r}
+LOGvarnames = c("N")
+LOGparnames = c("r","K")
+```
+
+To use lsoda, we need to specify initial conditions:
+```{r}
+x0 = c(2500)
+names(x0) = LOGvarnames
+```
+
+Specify the values for the parameter vector theta = c(r,K):
+```{r}
+LOGpars = c(1.0,10000)
+names(LOGpars) = LOGparnames
+```
+
+We need a function to evaluate the logistic equation:
+```{r}
+log.ode = function(times,x,p){
+  dx = x
+  dimnames(dx) = dimnames(x)
+  dx["N"] = (p["r"] * x["N"] * (p["K"] - x["N"])) / p["K"]
+  return(list(dx))
+}
+```
+
+Now define a time vector from 0 to 10
+```{r}
+logplottimes = seq(0,10,0.25)
+```
+
+Call function "lsoda" to compute the approximate solution at the time values specified above. The output should be an nx2 matrix where the first column is the evaluation times.
+```{r}
+out = lsoda(x0,times=logplottimes,log.ode,LOGpars)
+```
+
+Plotting out should obtain a classic logistic curve:
+```{r}
+matplot(out[,1],out[,2], type="l",xlab="Time",ylab="N")
+```
+
+Now we will generate some data with noise drawn from a normal distribution with mean zero and standard deviation 200:
+```{r}
+LOGtimes = seq(0,10,0.25)
+LOGn = length(LOGtimes)
+out = lsoda(x0,time=LOGtimes,log.ode,LOGpars)
+LOGdata = out[,2] + 200*matrix(rnorm(LOGn), LOGn, 1)
+colnames(LOGdata) = "N"
+matplot(LOGdata[,1], type="l",xlab="Time",ylab="N")
+```
+
+# Obtain initial coefficient estimates using *fda* package 
+
+First define the range of the basis and the breaks:
+```{r}
+LOGrange = c(0,10)
+breaks = seq(0,10,0.25)
+```
+
+Then specify the order of the polynomial segments, which is one more than the highest power in the polynomial. We will use cubic polynomial splines.
+```{r}
+LOGbasis = create.bspline.basis(LOGrange,norder=4,breaks=breaks)
+```
+
+Obtain initial estimates of matrix of coefficients C by employing the "smooth.fd" function in *fda*. We assume a lambda (smoothing weight) of 1. Object "coefs0" has to be named. In some examples, the data matrix and thus coefs0 is automatically named correctly, but it doesn't seem to happen for this example. If you don't name the column(s), you'll get thrown an error with ParsMatchOpt.
+```{r}
+LOGfdPar = fdPar(LOGbasis, int2Lfd(2), 1)
+LOGfd = smooth.basis(LOGtimes,LOGdata,LOGfdPar)$fd
+coefs0 = LOGfd$coefs
+colnames(coefs0) = "N"
+```
+
+Examine the fit of the smoothed function data to the data:
+```{r}
+plotfit.fd(LOGdata, LOGtimes, LOGfd,xlab="Time",ylab="N")
+```
+
+# Using *CollocInfer*
+
+To obtain parameter estimates from *CollocInfer*, we need 1) a basis system, 2) a function to evaluate and 3) initial values to start off the iterative estimation of theta and matrix C. We already have our basis system and initial values for matrix C, both from the previous step.
+
+First we need to set up the function to evaluate f(x;t,theta). The package requires that f is a function with arguments: t (a vector of evaluation times), x (a matrix of evaluations of x(t) at the times in t with rows corresponding to time points), p (a vector of parameters) and more (a list of additional inputs f might require).
+
+For the logistic equation, the function is:
+```{r}
+log.fun = function(times,x,p,more){
+  dx = x
+  dx[,"N"] = (p["r"] * x[,"N"] * (p["K"] - x[,"N"])) / p["K"]
+  return(dx)
+}
+```
+
+We now need initial parameter estimates. We will use gradient matching to get an initial estimate of parameters. The function "ParsMatchOpt" minimises the integrated summed squared error (ISSE(theta,x-hat)) and returns a named list containing the optimized parameter values. To run this function, we need a "proc" object, which maps x to Dx. We'll also first obtain a "lik" object, which maps x to y. We have to choose a weight for the unlawfulness penalty. Below we'll iterate over several values to select the best one.
+```{r}
+lambda = 100
+profile.obj = LS.setup(pars=LOGpars,fn=log.fun,lambda=lambda,times=LOGtimes,coefs=coefs0,basisvals=LOGbasis)
+
+init.proc = profile.obj$proc
+init.lik = profile.obj$lik
+```
+
+Now we use gradient matching to get initial parameter estimates:
+```{r}
+LOGParsMatchOpt = ParsMatchOpt(LOGpars,coefs0,init.proc)
+pars0 = LOGParsMatchOpt$pars
+pars0
+```
+
+# Choosing lambda using forward prediction error
+We need to define starting and ending times. These are given in a matrix where it is the index of the given observation times. Here we will start from each time point and predict 5 ahead:
+```{r}
+whichtimes = cbind(1:5,6:10)
+```
+
+Now we'll cycle through values of lambda increasing as powers of 10, report the resulting parameter estimates and overlay the estimated trajectory on a plot of the data. To make things more computationally efficient, we'll update the starting value for the parameters and coefficients to be the estimate of the previous lambda.
+```{r eval=FALSE, include=TRUE}
+matplot(LOGtimes,LOGdata,pch=LOGvarnames)
+lambdas = 10^(0:7)
+FPEs = 0*lambdas
+temp.pars = LOGpars
+temp.coefs = coefs0
+
+for (ilam in 1:3){
+  print(paste("lambda = ", lambdas[ilam]))
+  t.Ores = Profile.LS(log.fun, LOGdata, LOGtimes, temp.pars, temp.coefs, LOGbasis, lambdas[ilam])
+  print(t.Ores$pars)
+  temp.pars = t.Ores$pars
+  temp.coefs = t.Ores$coefs
+  temp.lik = t.Ores$lik
+  temp.proc = t.Ores$proc
+  t.fd = fd(t.Ores$coefs,LOGbasis)
+  lines(t.fd,lwd=2,col=ceiling(ilam/2),lty=1)
+  FPEs[ilam] = forward.prediction.error(LOGtimes,LOGdata,t.Ores$coefs,temp.lik,temp.proc,t.Ores$pars,whichtimes)
+}
+FPEs
+```
+
+# Choosing lambda visually
+Since choosing by FPE throws an error, we'll choose lambda visually. We'll choose the smallest lambda that sufficiently smooths the data.
+```{r}
+matplot(LOGtimes,LOGdata,pch=LOGvarnames)
+lambdas = 10^(0:7)
+temp.pars = LOGpars
+temp.coefs = coefs0
+
+for (ilam in 1:length(lambdas)){
+  print(paste("lambda = ", lambdas[ilam]))
+  t.Ores = Profile.LS(log.fun, LOGdata, LOGtimes, temp.pars, temp.coefs, LOGbasis, lambdas[ilam])
+  print(t.Ores$pars)
+  temp.pars = t.Ores$pars
+  temp.coefs = t.Ores$coefs
+  temp.lik = t.Ores$lik
+  temp.proc = t.Ores$proc
+  t.fd = fd(t.Ores$coefs,LOGbasis)
+  lines(t.fd,lwd=2,col=ceiling(ilam/2),lty=1)
+}
+```
+
+# Getting final coefficients and final parameter estimates 
+We'll use lambda = 100 to obtain final parameter and coefficient estimates.
+```{r}
+lambda = 10^2
+final.profile = Profile.LS(log.fun, LOGdata, LOGtimes, temp.pars, temp.coefs, LOGbasis,lambda)
+final.pars = final.profile$pars
+final.coefs = final.profile$coefs
+final.lik = final.profile$lik
+final.proc = final.profile$proc
+#Print final parameter estimates
+final.pars
+```
+
+# Calculate confidence intervals
+```{r}
+covar = Profile.covariance(final.pars, times = LOGtimes, data = LOGdata, coefs = final.coefs, lik = final.lik, proc = final.proc)
+CIs = cbind(final.pars - 2 * sqrt(diag(covar)),final.pars + 2 * sqrt(diag(covar)) )
+rownames(CIs) = LOGparnames
+CIs
+```
+
